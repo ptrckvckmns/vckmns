@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coming Soon</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html, body {
+            width: 100%; height: 100%;
+            overflow: hidden;
+            background: #000;
+            cursor: none;
+        }
+
+        #spaceCanvas {
+            position: fixed;
+            inset: 0;
+            display: block;
+        }
+
+        /* Custom cursor */
+        #cur {
+            position: fixed;
+            width: 16px; height: 16px;
+            border: 1.5px solid #a78bfa;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 9999;
+            transform: translate(-50%,-50%);
+            box-shadow: 0 0 8px #a78bfa;
+            will-change: transform, left, top;
+            transition: border-color .2s;
+        }
+
+        /* Content */
+        #content {
+            position: fixed;
+            inset: 0;
+            z-index: 10;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: none;
+        }
+
+        .msg {
+            text-align: center;
+            padding: 0 20px;
+        }
+
+        .msg p {
+            font-family: Georgia, 'Times New Roman', serif;
+            font-size: clamp(18px, 3.5vw, 38px);
+            color: rgba(230, 225, 255, 0.88);
+            line-height: 1.9;
+            letter-spacing: 0.04em;
+            /* Subtle text glow — cheap, GPU-composited */
+            text-shadow:
+                0 0 30px rgba(167,139,250,0.5),
+                0 0 80px rgba(167,139,250,0.15);
+            animation: breathe 6s ease-in-out infinite;
+        }
+
+        @keyframes breathe {
+            0%,100% { opacity: 0.88; }
+            50%      { opacity: 1;    }
+        }
+    </style>
+</head>
+<body>
+
+<div id="cur"></div>
+<canvas id="spaceCanvas"></canvas>
+
+<div id="content">
+    <div class="msg">
+        <p>
+            Coming soon...<br>
+            or not...<br>
+            Who cares anyway...<br>
+            I don't
+        </p>
+    </div>
+</div>
+
+<script>
+'use strict';
+
+// ─── CANVAS / CTX ───────────────────────────────────────────────────────────
+const CV  = document.getElementById('spaceCanvas');
+const CTX = CV.getContext('2d', { alpha: false });   // alpha:false = faster compositing
+const cur = document.getElementById('cur');
+
+let W = 0, H = 0;
+
+// ─── MOUSE ──────────────────────────────────────────────────────────────────
+const MX = { x: -9999, y: -9999, vx: 0, vy: 0, px: -9999, py: -9999 };
+
+window.addEventListener('mousemove', e => {
+    MX.vx = e.clientX - MX.x;
+    MX.vy = e.clientY - MX.y;
+    MX.x  = e.clientX;
+    MX.y  = e.clientY;
+    cur.style.left = e.clientX + 'px';
+    cur.style.top  = e.clientY + 'px';
+}, { passive: true });
+
+window.addEventListener('touchmove', e => {
+    const t = e.touches[0];
+    MX.x = t.clientX; MX.y = t.clientY;
+    cur.style.left = t.clientX + 'px';
+    cur.style.top  = t.clientY + 'px';
+}, { passive: true });
+
+// ─── PERFORMANCE HINT: use TypedArrays for all particle data ────────────────
+// Each array stores N particles with interleaved fields.
+// Stars: x, y, ox, oy, r, alpha, twOff, twSpd, depth, dx, dy, driftA, driftS
+const S_FIELDS = 13;
+const S_COUNT  = 350;                      // Reduced from 600
+let   starBuf  = new Float32Array(S_COUNT * S_FIELDS);
+// Milky way: x, y, r, a, dx, dy, depth  (no per-frame drift needed)
+const MW_FIELDS = 7;
+const MW_COUNT  = 800;                     // Reduced from 2000
+let   mwBuf     = new Float32Array(MW_COUNT * MW_FIELDS);
+
+// Star colour palette (pre-built, no string alloc per frame)
+const STAR_COLORS = ['#ffffff','#ccd6ff','#ffe4b5','#ffd700','#ffa07a','#c9b1ff','#e6e6ff'];
+// Pre-parse to [r,g,b] for fast fillStyle
+function hexToRgb(h) {
+    const n = parseInt(h.slice(1),16);
+    return [(n>>16)&255,(n>>8)&255,n&255];
+}
+const STAR_RGB = STAR_COLORS.map(hexToRgb);
+
+// Star colour index stored per star (field 12 extended via Uint8Array side-car)
+const starColorIdx = new Uint8Array(S_COUNT);
+
+// ─── OFFSCREEN STATIC BG ────────────────────────────────────────────────────
+// Background gradient + nebulae drawn once onto an offscreen canvas,
+// then blitted each frame. This avoids re-computing gradients every frame.
+let bgCanvas = null, bgCtx = null;
+
+function buildBg() {
+    bgCanvas = document.createElement('canvas');
+    bgCanvas.width  = W;
+    bgCanvas.height = H;
+    bgCtx = bgCanvas.getContext('2d', { alpha: false });
+
+    // Radial background
+    const bg = bgCtx.createRadialGradient(W/2, H*0.45, 0, W/2, H/2, Math.max(W,H)*0.85);
+    bg.addColorStop(0,   '#0e0520');
+    bg.addColorStop(0.3, '#07091a');
+    bg.addColorStop(0.7, '#040410');
+    bg.addColorStop(1,   '#000000');
+    bgCtx.fillStyle = bg;
+    bgCtx.fillRect(0, 0, W, H);
+
+    // Static nebulae (just gradients, no per-frame movement needed for these)
+    // Using 'screen' blending: draw them on top
+    const nebDefs = [
+        { hue: 260, x: W*0.18, y: H*0.22, r: W*0.28 },
+        { hue: 210, x: W*0.75, y: H*0.60, r: W*0.32 },
+        { hue: 290, x: W*0.50, y: H*0.80, r: W*0.22 },
+        { hue: 240, x: W*0.85, y: H*0.15, r: W*0.18 },
+        { hue: 200, x: W*0.10, y: H*0.70, r: W*0.20 },
+    ];
+    bgCtx.globalCompositeOperation = 'screen';
+    for (const n of nebDefs) {
+        const g = bgCtx.createRadialGradient(n.x, n.y, 0, n.x, n.y, n.r);
+        g.addColorStop(0,   `hsla(${n.hue},70%,40%,0.07)`);
+        g.addColorStop(0.5, `hsla(${n.hue+20},55%,25%,0.04)`);
+        g.addColorStop(1,   'transparent');
+        bgCtx.fillStyle = g;
+        bgCtx.beginPath();
+        bgCtx.arc(n.x, n.y, n.r, 0, Math.PI*2);
+        bgCtx.fill();
+    }
+
+    // Milky way soft haze (static glow band)
+    bgCtx.globalCompositeOperation = 'screen';
+    const mwx1 = W*0.1, mwy1 = H*0.9, mwx2 = W*0.9, mwy2 = H*0.1;
+    const mwg  = bgCtx.createLinearGradient(mwx1, mwy1, mwx2, mwy2);
+    mwg.addColorStop(0,   'transparent');
+    mwg.addColorStop(0.4, 'rgba(130,100,200,0.05)');
+    mwg.addColorStop(0.5, 'rgba(160,140,220,0.09)');
+    mwg.addColorStop(0.6, 'rgba(130,100,200,0.05)');
+    mwg.addColorStop(1,   'transparent');
+    bgCtx.fillStyle = mwg;
+    bgCtx.fillRect(0, 0, W, H);
+
+    // Galaxies (static, drawn once)
+    bgCtx.globalCompositeOperation = 'screen';
+    const galDefs = [
+        { x: W*0.13, y: H*0.18, r: 55,  ang: 0.3,  c1:'rgba(200,170,255,', c2:'rgba(100,130,255,' },
+        { x: W*0.84, y: H*0.14, r: 42,  ang:-0.5,  c1:'rgba(255,200,150,', c2:'rgba(200,100,255,' },
+        { x: W*0.70, y: H*0.78, r: 65,  ang: 1.1,  c1:'rgba(150,200,255,', c2:'rgba(180,100,220,' },
+        { x: W*0.06, y: H*0.72, r: 36,  ang: 0.8,  c1:'rgba(255,220,200,', c2:'rgba(255,160,100,' },
+        { x: W*0.52, y: H*0.08, r: 32,  ang:-0.2,  c1:'rgba(200,240,255,', c2:'rgba(120,180,255,' },
+    ];
+    for (const g of galDefs) drawGalaxy(bgCtx, g);
+
+    bgCtx.globalCompositeOperation = 'source-over';
+}
+
+function drawGalaxy(c, g) {
+    c.save();
+    c.translate(g.x, g.y);
+    c.rotate(g.ang);
+    c.scale(1, 0.32);
+
+    // Core
+    const core = c.createRadialGradient(0,0,0, 0,0, g.r*0.28);
+    core.addColorStop(0,   g.c1+'0.6)');
+    core.addColorStop(0.6, g.c2+'0.25)');
+    core.addColorStop(1,   'transparent');
+    c.globalAlpha = 0.8;
+    c.fillStyle = core;
+    c.beginPath(); c.arc(0,0,g.r*0.28,0,Math.PI*2); c.fill();
+
+    // Arms x2
+    for (let a=0; a<2; a++) {
+        c.save();
+        c.rotate(a * Math.PI);
+        const ag = c.createLinearGradient(0,0,g.r,0);
+        ag.addColorStop(0,   g.c1+'0.4)');
+        ag.addColorStop(0.6, g.c2+'0.1)');
+        ag.addColorStop(1,   'transparent');
+        c.globalAlpha = 0.4;
+        c.strokeStyle = ag;
+        c.lineWidth   = g.r*0.22;
+        c.lineCap     = 'round';
+        c.beginPath();
+        c.moveTo(0,0);
+        c.bezierCurveTo(g.r*0.3,-g.r*0.12, g.r*0.65,-g.r*0.04, g.r,0);
+        c.stroke();
+        c.restore();
+    }
+
+    // Halo
+    const halo = c.createRadialGradient(0,0,g.r*0.2, 0,0, g.r);
+    halo.addColorStop(0, g.c2+'0.06)');
+    halo.addColorStop(1, 'transparent');
+    c.globalAlpha = 0.5;
+    c.fillStyle = halo;
+    c.beginPath(); c.arc(0,0,g.r,0,Math.PI*2); c.fill();
+
+    c.restore();
+}
+
+// ─── INIT STARS (TypedArray) ─────────────────────────────────────────────────
+// Fields: x,y, ox,oy, r, alpha, twOff, twSpd, depth, dx,dy, driftA, driftS
+function initStars() {
+    for (let i = 0; i < S_COUNT; i++) {
+        const b = i * S_FIELDS;
+        const x = Math.random() * W;
+        const y = Math.random() * H;
+        starBuf[b+0] = x;   // x
+        starBuf[b+1] = y;   // y
+        starBuf[b+2] = x;   // ox
+        starBuf[b+3] = y;   // oy
+        starBuf[b+4] = Math.random() * 1.4 + 0.3;           // r
+        starBuf[b+5] = Math.random();                        // alpha
+        starBuf[b+6] = Math.random() * Math.PI * 2;         // twinkle offset
+        starBuf[b+7] = (Math.random()*0.003+0.0008) * (Math.random()<.5?1:-1); // twinkle speed
+        starBuf[b+8] = Math.random();                        // depth
+        starBuf[b+9] = 0; starBuf[b+10] = 0;               // dx, dy
+        starBuf[b+11]= Math.random() * Math.PI * 2;         // driftAngle
+        starBuf[b+12]= Math.random() * 0.0003 + 0.00008;   // driftSpeed
+        starColorIdx[i] = Math.floor(Math.random() * STAR_COLORS.length);
+    }
+}
+
+// ─── INIT MILKY WAY PARTICLES ────────────────────────────────────────────────
+// Fields: x,y,r,a,dx,dy,depth
+function initMW() {
+    for (let i = 0; i < MW_COUNT; i++) {
+        const b = i * MW_FIELDS;
+        const along = (Math.random()-0.5) * W * 1.5;
+        const noise = (Math.random()-0.5) * H * 0.16;
+        mwBuf[b+0] = W*0.5 + along;
+        mwBuf[b+1] = H*0.5 + along*0.33 + noise;
+        mwBuf[b+2] = Math.random() * 0.8 + 0.1;   // r
+        mwBuf[b+3] = Math.random() * 0.5 + 0.1;   // alpha
+        mwBuf[b+4] = 0;                             // dx
+        mwBuf[b+5] = 0;                             // dy
+        mwBuf[b+6] = Math.random() * 0.08;         // depth
+    }
+}
+
+// ─── SHOOTING STARS ───────────────────────────────────────────────────────────
+// Simple object pool (max 3)
+const POOL_MAX = 3;
+const shootPool = [];
+let lastShooter = 0;
+
+function spawnShooter(ts) {
+    if (shootPool.length >= POOL_MAX) return;
+    shootPool.push({
+        x: Math.random() * W * 0.8,
+        y: Math.random() * H * 0.4,
+        ang: Math.PI/6 + Math.random()*Math.PI/8,
+        spd: 14 + Math.random()*14,
+        life: 1,
+        trail: new Float32Array(40),   // x0,y0,x1,y1...
+        trailLen: 0
+    });
+}
+
+function updateDrawShooters() {
+    for (let i = shootPool.length-1; i >= 0; i--) {
+        const s = shootPool[i];
+        s.x += Math.cos(s.ang)*s.spd;
+        s.y += Math.sin(s.ang)*s.spd;
+        s.life -= 0.022;
+
+        // Shift trail
+        const maxT = 10; // 10 points = 20 floats
+        if (s.trailLen < maxT) s.trailLen++;
+        // Rotate trail
+        const tf = s.trail;
+        for (let t = (s.trailLen-1)*2; t >= 2; t -= 2) {
+            tf[t]   = tf[t-2];
+            tf[t+1] = tf[t-1];
+        }
+        tf[0] = s.x; tf[1] = s.y;
+
+        if (s.life <= 0 || s.x > W+120 || s.y > H+120) {
+            shootPool.splice(i,1); continue;
+        }
+
+        // Draw trail
+        if (s.trailLen < 2) continue;
+        CTX.save();
+        CTX.lineCap = 'round';
+        for (let t = 1; t < s.trailLen; t++) {
+            const frac = 1 - t/s.trailLen;
+            const a = s.life * frac * 0.85;
+            if (a < 0.01) continue;
+            CTX.globalAlpha  = a;
+            CTX.strokeStyle  = '#fffff0';
+            CTX.lineWidth    = frac * 2;
+            CTX.shadowBlur   = 0; // avoid per-segment shadow
+            CTX.beginPath();
+            CTX.moveTo(tf[(t-1)*2], tf[(t-1)*2+1]);
+            CTX.lineTo(tf[t*2],     tf[t*2+1]);
+            CTX.stroke();
+        }
+        CTX.restore();
+    }
+}
+
+// ─── CURSOR SPARKS (lightweight) ─────────────────────────────────────────────
+// Keep sparks in a typed array for speed: x,y,vx,vy,life,r  (6 floats each)
+const SP_MAX    = 60;
+const SP_FIELDS = 6;
+const spBuf     = new Float32Array(SP_MAX * SP_FIELDS);
+let   spCount   = 0;
+let   sparkTick = 0;
+// Spark colours pre-picked
+const SP_COLS = ['rgba(167,139,250,','rgba(96,165,250,','rgba(251,191,36,','rgba(196,181,253,'];
+
+function addSparks(x, y, n) {
+    for (let k = 0; k < n; k++) {
+        if (spCount >= SP_MAX) break;
+        const b = spCount * SP_FIELDS;
+        const a = Math.random() * Math.PI * 2;
+        const s = 0.8 + Math.random() * 2.5;
+        spBuf[b+0] = x;
+        spBuf[b+1] = y;
+        spBuf[b+2] = Math.cos(a)*s;
+        spBuf[b+3] = Math.sin(a)*s;
+        spBuf[b+4] = 1;
+        spBuf[b+5] = 0.6 + Math.random()*0.8;
+        spCount++;
+    }
+}
+
+function updateDrawSparks() {
+    let alive = 0;
+    for (let i = 0; i < spCount; i++) {
+        const b = i * SP_FIELDS;
+        spBuf[b+0] += spBuf[b+2];
+        spBuf[b+1] += spBuf[b+3];
+        spBuf[b+2] *= 0.93;
+        spBuf[b+3] *= 0.93;
+        spBuf[b+4] -= 0.03;
+        if (spBuf[b+4] <= 0) continue;
+        // Compact
+        if (alive !== i) {
+            const dst = alive*SP_FIELDS;
+            spBuf[dst]   = spBuf[b];   spBuf[dst+1] = spBuf[b+1];
+            spBuf[dst+2] = spBuf[b+2]; spBuf[dst+3] = spBuf[b+3];
+            spBuf[dst+4] = spBuf[b+4]; spBuf[dst+5] = spBuf[b+5];
+        }
+        alive++;
+    }
+    spCount = alive;
+
+    if (spCount === 0) return;
+    CTX.save();
+    CTX.shadowBlur = 0; // no shadow per spark — batch instead
+    for (let i = 0; i < spCount; i++) {
+        const b  = i * SP_FIELDS;
+        const li = spBuf[b+4];
+        const r  = spBuf[b+5] * li;
+        const ci = i % SP_COLS.length;
+        CTX.globalAlpha = li * 0.9;
+        CTX.fillStyle   = SP_COLS[ci] + li.toFixed(2) + ')';
+        CTX.beginPath();
+        CTX.arc(spBuf[b], spBuf[b+1], Math.max(0.2, r), 0, Math.PI*2);
+        CTX.fill();
+    }
+    CTX.restore();
+}
+
+// ─── RESIZE ───────────────────────────────────────────────────────────────────
+function resize() {
+    W = CV.width  = window.innerWidth;
+    H = CV.height = window.innerHeight;
+    buildBg();
+    initStars();
+    initMW();
+}
+window.addEventListener('resize', resize);
+
+// ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+const INF_S  = 160;   // star influence radius
+const INF_MW = 200;   // milky way influence radius
+
+let lastTs = 0;
+function frame(ts) {
+    requestAnimationFrame(frame);
+
+    const dt  = Math.min((ts - lastTs) * 0.001, 0.05);  // cap dt to avoid spiral on tab-switch
+    lastTs    = ts;
+    const t   = ts * 0.001;
+
+    // ── Blit static background ──────────────────────────────────────────────
+    CTX.globalAlpha = 1;
+    CTX.globalCompositeOperation = 'source-over';
+    CTX.drawImage(bgCanvas, 0, 0);
+
+    // ── Milky way particles ──────────────────────────────────────────────────
+    // Process in bulk — skip individual save/restore
+    CTX.globalCompositeOperation = 'screen';
+    const inf2_mw = INF_MW * INF_MW;
+    for (let i = 0; i < MW_COUNT; i++) {
+        const b  = i * MW_FIELDS;
+        const px = mwBuf[b+0], py = mwBuf[b+1];
+        const cdx = px + mwBuf[b+4] - MX.x;
+        const cdy = py + mwBuf[b+5] - MX.y;
+        const d2  = cdx*cdx + cdy*cdy;
+        if (d2 < inf2_mw) {
+            const d    = Math.sqrt(d2);
+            const force= (1 - d/INF_MW) * mwBuf[b+6] * 40;
+            const invd = 1/d;
+            mwBuf[b+4] += (cdx*invd*force - mwBuf[b+4]) * 0.1;
+            mwBuf[b+5] += (cdy*invd*force - mwBuf[b+5]) * 0.1;
+        } else {
+            mwBuf[b+4] *= 0.94;
+            mwBuf[b+5] *= 0.94;
+        }
+        const rx = px + mwBuf[b+4];
+        const ry = py + mwBuf[b+5];
+        CTX.globalAlpha = mwBuf[b+3] * 0.65;
+        CTX.fillStyle   = '#d0d8ff';
+        CTX.beginPath();
+        CTX.arc(rx, ry, mwBuf[b+2], 0, Math.PI*2);
+        CTX.fill();
+    }
+
+    // ── Stars ────────────────────────────────────────────────────────────────
+    CTX.globalCompositeOperation = 'screen';
+    const inf2_s = INF_S * INF_S;
+    for (let i = 0; i < S_COUNT; i++) {
+        const b   = i * S_FIELDS;
+        // Twinkle
+        starBuf[b+5] = 0.45 + 0.55 * Math.sin(t * starBuf[b+7] * 55 + starBuf[b+6]);
+        // Drift
+        starBuf[b+11] += starBuf[b+12];
+        starBuf[b+2]  += Math.cos(starBuf[b+11]) * 0.02;
+        starBuf[b+3]  += Math.sin(starBuf[b+11]) * 0.02;
+        // Wrap origins
+        if (starBuf[b+2] < -10) starBuf[b+2] = W+10;
+        if (starBuf[b+2] > W+10) starBuf[b+2] = -10;
+        if (starBuf[b+3] < -10) starBuf[b+3] = H+10;
+        if (starBuf[b+3] > H+10) starBuf[b+3] = -10;
+        // Cursor repulsion
+        const depth   = starBuf[b+8];
+        const inf     = INF_S + depth*100;
+        const cdx     = starBuf[b+2] + starBuf[b+9]  - MX.x;
+        const cdy     = starBuf[b+3] + starBuf[b+10] - MX.y;
+        const d2      = cdx*cdx + cdy*cdy;
+        if (d2 < inf*inf) {
+            const d    = Math.sqrt(d2);
+            const force= (1-d/inf) * (0.6+depth*2.0);
+            const invd = 1/d;
+            const tdx  = cdx*invd * force*inf*0.15;
+            const tdy  = cdy*invd * force*inf*0.15;
+            starBuf[b+9]  += (tdx - starBuf[b+9])  * 0.12;
+            starBuf[b+10] += (tdy - starBuf[b+10]) * 0.12;
+        } else {
+            const ease = 0.04 + depth*0.03;
+            starBuf[b+9]  *= (1-ease);
+            starBuf[b+10] *= (1-ease);
+        }
+        const sx  = starBuf[b+2] + starBuf[b+9];
+        const sy  = starBuf[b+3] + starBuf[b+10];
+        const r   = starBuf[b+4];
+        const al  = starBuf[b+5] * (0.4 + depth*0.6);
+        const rgb = STAR_RGB[starColorIdx[i]];
+        CTX.globalAlpha = al;
+        CTX.fillStyle   = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+        CTX.beginPath();
+        CTX.arc(sx, sy, r, 0, Math.PI*2);
+        CTX.fill();
+        // Larger stars: simple glow via slightly bigger semi-transparent circle
+        if (r > 1.1 && al > 0.5) {
+            CTX.globalAlpha = al * 0.25;
+            CTX.beginPath();
+            CTX.arc(sx, sy, r*3.5, 0, Math.PI*2);
+            CTX.fill();
+        }
+    }
+
+    CTX.globalCompositeOperation = 'source-over';
+
+    // ── Shooting stars ───────────────────────────────────────────────────────
+    if (ts - lastShooter > 2500 + Math.random()*2500) {
+        spawnShooter(ts);
+        lastShooter = ts;
+    }
+    updateDrawShooters();
+
+    // ── Cursor sparks ────────────────────────────────────────────────────────
+    sparkTick += dt;
+    const spd = Math.abs(MX.vx) + Math.abs(MX.vy);
+    if (sparkTick > 0.05 && spd > 4) {
+        addSparks(MX.x, MX.y, spd > 12 ? 2 : 1);
+        sparkTick = 0;
+    }
+    updateDrawSparks();
+
+    // Reset velocity each frame (only fresh deltas matter)
+    MX.vx = 0; MX.vy = 0;
+}
+
+// ─── BOOT ─────────────────────────────────────────────────────────────────────
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
